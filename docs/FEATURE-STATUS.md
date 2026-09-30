@@ -31,6 +31,9 @@ treasury at a terminal transition.
 | :--- | :---: | :--- |
 | `create_escrow` | ✅ Implemented | Validates amount/timeout, buyer+seller auth, takes the SEP-41 token address |
 | `deposit` | ✅ Implemented | **Real token transfer** buyer → contract, before any state write |
+| `release` | ✅ Implemented | Seller-authorized; **real token transfer** contract → seller |
+| `refund` | ✅ Implemented | Seller pre-deadline / buyer post-deadline; **real token transfer** |
+| `refund_expired` | ✅ Implemented | Permissionless strictly after timeout; `Funded` only, disputed escrows frozen |
 | `release` | ✅ Implemented | Seller-authorized; **real token transfer** contract → seller (full remaining balance) |
 | `release_partial` | ✅ Implemented | Seller-authorized; **real token transfer** of a partial amount contract → seller; `released` accounting tracked; final partial transitions to `Completed`; `refund`/`resolve` operate on remaining balance |
 | `refund` | ✅ Implemented | Seller pre-deadline / buyer post-deadline; **real token transfer** of remaining balance |
@@ -39,6 +42,9 @@ treasury at a terminal transition.
 | `cancel` | ✅ Implemented | Buyer, `Pending` only; removes id from each distinct participant index after validation/auth |
 | `get_status` / `get_escrow` / `escrows_for_participant` | ✅ Implemented | Read-only views; participant index excludes cancelled ids but retains other terminal records; live offset pagination, restart at cursor 0 after cancellation |
 | `touch_ttl` | ✅ Implemented | Permissionless TTL keeper for the escrow's persistent entry |
+| Events | ✅ Implemented | Includes distinct `RefundExpired` keeper event; escrow id as topic |
+| Storage | ✅ Persistent + TTL | Per-id persistent entries; instance storage only for the id counter |
+| Tests | ✅ 55 | Full lifecycle, dispute paths, expiry-refund boundary and event coverage, failure ordering, conservation property, **randomized property suite** (proptest), and **negative-auth suite** (`authz.rs`) |
 | Events | ✅ Implemented | `EscrowCreated`, `Deposited`, `Released`, `PartiallyReleased`, `Refunded`, `Disputed`, `Resolved`, `Cancelled`; id as topic |
 | Storage | ✅ Persistent + TTL | Per-id persistent entries; instance storage only for the id counter; **backward-compatible schema migration** via `EscrowDataV1` fallback decode (old records default `released = 0`) |
 | Tests | ✅ 85 | Full lifecycle, dispute paths, cancellation index maintenance and live-pagination interleaving, failure ordering, conservation property, partial-release (valid/multi/final/zero/negative/over-remaining/non-Funded/after-completion/→refund/→dispute→resolve, storage compat, conservation), **randomized property suite** (proptest): conservation over random paths + partial-release sequences, tamper-resilient pool conservation, fund safety over arbitrary call sequences (now includes `release_partial`), multi-party create/cancel participant-index consistency; **negative-auth suite** (`authz.rs`): per-entrypoint wrong-signer rejection, `release_partial` seller-only auth + mutation test, signature/args replay rejection, `env.auths()` authorization-tree assertions |
