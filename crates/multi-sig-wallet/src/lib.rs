@@ -2762,7 +2762,7 @@ mod tests {
     #[test]
     fn reject_emits_event_with_tx_id_and_rejector() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
 
         let event_collection = env.events().all();
