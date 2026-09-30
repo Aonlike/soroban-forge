@@ -275,26 +275,11 @@ compile_error!(
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::ForgeError;
+use soroban_forge_shared_utils::{bump_entry as shared_bump_entry, ForgeError};
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
     Env, IntoVal, Symbol, Val, Vec,
 };
-
-/// Ledger-time constants for TTL bumps.
-///
-/// One ledger closes roughly every 5 seconds, so 17,280 ledgers ≈ 1 day.
-/// `BUMP_AMOUNT` is the lifetime written on every touch; `BUMP_THRESHOLD`
-/// is how close to expiry an entry must be before a bump applies. The
-/// 30-day horizon comfortably covers an idle custody balance between keeper
-/// touches.
-mod ttl {
-    pub const DAY_IN_LEDGERS: u32 = 17_280;
-    /// Lifetime applied on every TTL touch.
-    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-    /// Bump only when the entry is within this window of expiring.
-    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
-}
 
 /// Public interface for the Soroban Forge multi-signature wallet contract.
 #[contractclient(name = "SorobanForgeMultiSigWalletClient")]
@@ -312,11 +297,14 @@ pub trait SorobanForgeMultiSigWallet {
     ///
     /// `target` is the contract address to invoke on execution;
     /// `tx` is the opaque payload passed to the target.
+    /// `expiry` is an optional ledger timestamp deadline; `None` preserves
+    /// immortal behavior.
     fn submit(
         env: Env,
         submitter: Address,
         target: Address,
         tx: Bytes,
+        expiry: Option<u64>,
     ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
 
     /// Submit a typed cross-contract call as a pending transaction.
@@ -326,17 +314,21 @@ pub trait SorobanForgeMultiSigWallet {
     /// `target.fn_name(args)` when executed. The call collects owner
     /// confirmations and executes only past the threshold, like any
     /// other transaction.
+    /// `expiry` is an optional ledger timestamp deadline; `None` preserves
+    /// immortal behavior.
     ///
     /// # Errors
     ///
     /// * [`ForgeError::NotInitialized`] — the wallet has no owner set.
     /// * [`ForgeError::Unauthorized`] — `submitter` is not an owner.
+    /// * [`ForgeError::DeadlineReached`] — `expiry` is in the past.
     fn submit_call(
         env: Env,
         submitter: Address,
         target: Address,
         fn_name: Symbol,
         args: Vec<Val>,
+        expiry: Option<u64>,
     ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
 
     /// Record `signer`'s approval of `tx_id`.
@@ -559,6 +551,15 @@ pub trait SorobanForgeMultiSigWallet {
     /// Uninitialized wallets read as `false`.
     fn is_owner(env: Env, address: Address) -> bool;
 
+    /// Check whether `tx_id` is live (read-only view).
+    ///
+    /// Returns `true` if the transaction exists, is `Pending`, and has not
+    /// reached its expiry deadline. Terminal or expired transactions read as `false`.
+    fn is_live(env: Env, tx_id: u64) -> bool;
+
+    /// Read-only alias for `is_live`.
+    fn is_tx_live(env: Env, tx_id: u64) -> bool;
+
     /// Read the confirmation list recorded for `tx_id`, in the order the
     /// confirmations were recorded (read-only view).
     ///
@@ -666,6 +667,8 @@ pub enum TxStatus {
     Executed,
     /// Vetoed by an owner; terminal.
     Rejected,
+    /// Expired before reaching the approval threshold; terminal.
+    Expired,
 }
 
 /// What a submitted transaction carries.
@@ -826,6 +829,8 @@ pub struct WalletTx {
     /// What the transaction carries: an opaque payload or a typed token
     /// withdrawal (see [`TxKind`]).
     pub kind: TxKind,
+    /// Optional ledger timestamp after which un-confirmed transactions expire.
+    pub expiry: Option<u64>,
 }
 
 /// Storage keys, split by class (see the storage-and-TTL notes in the
@@ -907,12 +912,18 @@ impl MultiSigWallet {
         submitter: Address,
         target: Address,
         tx: Bytes,
+        expiry: Option<u64>,
     ) -> Result<u64, ForgeError> {
         if !Self::is_initialized(&env) {
             return Err(ForgeError::NotInitialized);
         }
         if !Self::is_owner_impl(&env, &submitter) {
             return Err(ForgeError::Unauthorized);
+        }
+        if let Some(exp) = expiry {
+            if exp <= env.ledger().timestamp() {
+                return Err(ForgeError::DeadlineReached);
+            }
         }
         submitter.require_auth();
 
@@ -926,6 +937,7 @@ impl MultiSigWallet {
             rejections: Vec::new(&env),
             status: TxStatus::Pending,
             kind: TxKind::Opaque,
+            expiry,
         };
         env.storage()
             .persistent()
@@ -942,12 +954,18 @@ impl MultiSigWallet {
         target: Address,
         fn_name: Symbol,
         args: Vec<Val>,
+        expiry: Option<u64>,
     ) -> Result<u64, ForgeError> {
         if !Self::is_initialized(&env) {
             return Err(ForgeError::NotInitialized);
         }
         if !Self::is_owner_impl(&env, &submitter) {
             return Err(ForgeError::Unauthorized);
+        }
+        if let Some(exp) = expiry {
+            if exp <= env.ledger().timestamp() {
+                return Err(ForgeError::DeadlineReached);
+            }
         }
         submitter.require_auth();
 
@@ -965,6 +983,7 @@ impl MultiSigWallet {
                 fn_name,
                 args,
             }),
+            expiry,
         };
         env.storage()
             .persistent()
@@ -984,8 +1003,16 @@ impl MultiSigWallet {
     /// A rejected transaction returns [`ForgeError::InvalidInput`] unchanged.
     pub fn confirm(env: Env, tx_id: u64, signer: Address) -> Result<(), ForgeError> {
         let mut wallet_tx = Self::get_tx_impl(&env, tx_id)?;
+        if wallet_tx.status == TxStatus::Expired {
+            return Err(ForgeError::DeadlineReached);
+        }
         if wallet_tx.status != TxStatus::Pending {
             return Err(ForgeError::InvalidInput);
+        }
+        if let Some(exp) = wallet_tx.expiry {
+            if env.ledger().timestamp() >= exp {
+                return Err(ForgeError::DeadlineReached);
+            }
         }
         if !Self::is_owner_impl(&env, &signer) {
             return Err(ForgeError::Unauthorized);
@@ -1027,6 +1054,9 @@ impl MultiSigWallet {
     /// * [`ForgeError::NotFound`] — no transaction exists for `tx_id`.
     pub fn reject(env: Env, tx_id: u64, signer: Address) -> Result<(), ForgeError> {
         let mut wallet_tx = Self::get_tx_impl(&env, tx_id)?;
+        if wallet_tx.status == TxStatus::Expired {
+            return Err(ForgeError::DeadlineReached);
+        }
         if wallet_tx.status != TxStatus::Pending {
             return Err(ForgeError::InvalidInput);
         }
@@ -1070,6 +1100,9 @@ impl MultiSigWallet {
     /// any external call or state change (see the module docs).
     pub fn execute(env: Env, tx_id: u64) -> Result<(), ForgeError> {
         let mut wallet_tx = Self::get_tx_impl(&env, tx_id)?;
+        if wallet_tx.status == TxStatus::Expired {
+            return Err(ForgeError::DeadlineReached);
+        }
         if wallet_tx.status != TxStatus::Pending {
             return Err(ForgeError::InvalidInput);
         }
@@ -1228,6 +1261,7 @@ impl MultiSigWallet {
                 destination,
                 amount,
             }),
+            expiry: None,
         };
         env.storage()
             .persistent()
@@ -1743,6 +1777,7 @@ impl MultiSigWallet {
             rejections: Vec::new(env),
             status: TxStatus::Pending,
             kind: TxKind::LimitChange(change),
+            expiry: None,
         };
         env.storage()
             .persistent()
@@ -1795,6 +1830,7 @@ impl MultiSigWallet {
             rejections: Vec::new(env),
             status: TxStatus::Pending,
             kind,
+            expiry: None,
         };
         env.storage()
             .persistent()
@@ -1951,11 +1987,41 @@ impl MultiSigWallet {
         owners.contains(address)
     }
 
+    /// Check whether `tx_id` is live (read-only view).
+    /// Returns `true` if the transaction exists, is `Pending`, and has not expired.
+    pub fn is_live(env: Env, tx_id: u64) -> bool {
+        let Ok(wallet_tx) = Self::get_tx_impl(&env, tx_id) else {
+            return false;
+        };
+        wallet_tx.status == TxStatus::Pending
+    }
+
+    /// Read-only alias for `is_live`.
+    pub fn is_tx_live(env: Env, tx_id: u64) -> bool {
+        Self::is_live(env, tx_id)
+    }
+
     fn get_tx_impl(env: &Env, tx_id: u64) -> Result<WalletTx, ForgeError> {
-        env.storage()
+        let mut wallet_tx: WalletTx = env
+            .storage()
             .persistent()
             .get(&DataKey::Tx(tx_id))
-            .ok_or(ForgeError::NotFound)
+            .ok_or(ForgeError::NotFound)?;
+        if wallet_tx.status == TxStatus::Pending {
+            if let Some(exp) = wallet_tx.expiry {
+                if env.ledger().timestamp() >= exp {
+                    let threshold: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::Threshold)
+                        .unwrap_or(u32::MAX);
+                    if wallet_tx.confirmations.len() < threshold {
+                        wallet_tx.status = TxStatus::Expired;
+                    }
+                }
+            }
+        }
+        Ok(wallet_tx)
     }
 }
 
@@ -2007,13 +2073,14 @@ fn transfer_from_contract(
     }
 }
 
-/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
-/// it falls inside [`ttl::BUMP_THRESHOLD`]. The standard threshold/extend
-/// pattern: cheap no-op while the entry is fresh, decisive near expiry.
+/// Bump a persistent entry's TTL to the workspace policy's 30-day horizon
+/// when it falls inside its one-day threshold — see
+/// `soroban_forge_shared_utils::ttl`.
+///
+/// Thin wrapper over [`soroban_forge_shared_utils::bump_entry`] — the
+/// canonical helper (issue #127); the policy lives there.
 fn bump_entry(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
+    shared_bump_entry(env, key);
 }
 
 /// Lifecycle events. The tx id is a **topic** so indexers can filter
@@ -2046,11 +2113,19 @@ mod events {
         pub threshold: u32,
     }
 
-    #[contractevent]
+       #[contractevent]
     pub struct TxRejected {
         #[topic]
         pub tx_id: u64,
         pub rejector: Address,
+    }
+
+    #[contractevent]
+    #[allow(dead_code)]
+    pub struct TxExpired {
+        #[topic]
+        pub tx_id: u64,
+        pub expired_at: u64,
     }
 
     pub fn submitted(env: &Env, tx: &WalletTx) {
@@ -2080,12 +2155,17 @@ mod events {
         .publish(env);
     }
 
+
     pub fn rejected(env: &Env, tx: &WalletTx) {
         TxRejected {
             tx_id: tx.tx_id,
             rejector: tx.rejections.get_unchecked(tx.rejections.len() - 1),
         }
         .publish(env);
+    }
+    #[allow(dead_code)]
+    pub fn expired(env: &Env, tx_id: u64, expired_at: u64) {
+        TxExpired { tx_id, expired_at }.publish(env);
     }
 }
 
@@ -2102,51 +2182,15 @@ mod authz;
 mod props;
 
 #[cfg(test)]
+mod indexer_fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_forge_test_utils::TestAccounts;
+    use soroban_forge_test_utils::{MockTarget, MockTargetClient, TestAccounts};
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
     use soroban_sdk::{contract, contractimpl, Bytes, Env, FromVal, Map, Symbol, TryIntoVal, Val};
-
-    /// A minimal mock target contract for testing cross-contract
-    /// invocation. Its `execute` method is a no-op that accepts the
-    /// payload without panicking, proving the invocation succeeded.
-    #[contract]
-    pub struct MockTarget;
-
-    #[contracttype]
-    enum MockTargetKey {
-        /// Account balances (unused, but required for the contract).
-        Balance(Address),
-    }
-
-    #[contractimpl]
-    impl MockTarget {
-        /// Accept the invocation. Does not access storage, so it
-        /// works reliably through `try_invoke_contract` in the test
-        /// host.
-        pub fn execute(_env: Env, _payload: Bytes) {}
-    }
-
-    /// A mock target whose `execute` panics, simulating a target
-    /// revert for testing the failure-ordering guarantee.
-    #[contract]
-    pub struct BlockingTarget;
-
-    #[contracttype]
-    enum BlockingTargetKey {
-        /// Account balances (unused, but required for the contract).
-        Balance(Address),
-    }
-
-    #[contractimpl]
-    impl BlockingTarget {
-        /// Panics on invocation, simulating a target revert.
-        pub fn execute(_env: Env, _payload: Bytes) {
-            panic!("target reverted");
-        }
-    }
 
     /// Build a fresh env with mocked auths, a registered contract, a configured
     /// wallet (threshold 2), and named accounts. The generated client exposes
@@ -2351,7 +2395,7 @@ mod tests {
     #[test]
     fn submit_creates_pending_tx() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         let tx = client.get_tx(&tx_id);
         assert_eq!(tx.submitter, accounts.user1);
         assert_eq!(tx.status, TxStatus::Pending);
@@ -2364,7 +2408,7 @@ mod tests {
         let mock_target_id = Address::generate(&env);
         env.register_at(&mock_target_id, MockTarget, ());
 
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         assert_eq!(env.events().all().events().len(), 1);
         let (topics, data) = event_values(&env);
         assert_eq!(
@@ -2446,8 +2490,8 @@ mod tests {
     #[test]
     fn submit_assigns_distinct_ids() {
         let (env, client, accounts) = setup!();
-        let id1 = client.submit(&accounts.user1, &target(&env), &payload(&env));
-        let id2 = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let id1 = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
+        let id2 = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         assert_ne!(id1, id2);
     }
 
@@ -2455,7 +2499,7 @@ mod tests {
     fn submit_rejects_non_owner() {
         let (env, client, accounts) = setup!();
         let err = client
-            .try_submit(&accounts.arbiter, &accounts.arbiter, &payload(&env))
+            .try_submit(&accounts.arbiter, &accounts.arbiter, &payload(&env), &None)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, ForgeError::Unauthorized);
@@ -2470,7 +2514,7 @@ mod tests {
         let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
         let accounts = TestAccounts::generate(&env);
         let err = client
-            .try_submit(&accounts.user1, &accounts.user1, &payload(&env))
+            .try_submit(&accounts.user1, &accounts.user1, &payload(&env), &None)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, ForgeError::NotInitialized);
@@ -2479,7 +2523,7 @@ mod tests {
     #[test]
     fn confirm_records_approval() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         let tx = client.get_tx(&tx_id);
         assert_eq!(tx.confirmations.len(), 1);
@@ -2489,7 +2533,7 @@ mod tests {
     #[test]
     fn confirm_twice_is_invalid() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         let err = client
             .try_confirm(&tx_id, &accounts.user2)
@@ -2502,7 +2546,7 @@ mod tests {
     #[test]
     fn confirm_non_owner_is_unauthorized() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         let err = client
             .try_confirm(&tx_id, &accounts.arbiter)
             .unwrap_err()
@@ -2526,7 +2570,7 @@ mod tests {
     #[test]
     fn reject_records_objection() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         let tx = client.get_tx(&tx_id);
         assert_eq!(tx.rejections.len(), 1);
@@ -2537,7 +2581,7 @@ mod tests {
     #[test]
     fn reject_twice_is_invalid() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         let err = client
             .try_reject(&tx_id, &accounts.user2)
@@ -2549,7 +2593,7 @@ mod tests {
     #[test]
     fn reject_non_owner_is_unauthorized() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         let err = client
             .try_reject(&tx_id, &accounts.arbiter)
             .unwrap_err()
@@ -2570,7 +2614,7 @@ mod tests {
     #[test]
     fn one_owner_rejection_makes_tx_terminal() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         let tx = client.get_tx(&tx_id);
         assert_eq!(tx.status, TxStatus::Rejected);
@@ -2587,7 +2631,7 @@ mod tests {
         let accounts = TestAccounts::generate(&env);
         let owners = owner_vec(&env, &accounts);
         client.initialize(&owners, &1_u32);
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         assert_eq!(client.get_tx(&tx_id).status, TxStatus::Rejected);
     }
@@ -2595,7 +2639,7 @@ mod tests {
     #[test]
     fn rejected_tx_cannot_be_confirmed() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         let before = client.get_tx(&tx_id);
         let err = client
@@ -2611,7 +2655,7 @@ mod tests {
     #[test]
     fn rejected_tx_cannot_be_executed() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         let before = client.get_tx(&tx_id);
         let err = client.try_execute(&tx_id).unwrap_err().unwrap();
@@ -2624,7 +2668,7 @@ mod tests {
     #[test]
     fn reject_rejected_tx_is_invalid() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         let before = client.get_tx(&tx_id);
         let err = client
@@ -2642,7 +2686,7 @@ mod tests {
         let (env, client, accounts) = setup!();
         let mock_target_id = Address::generate(&env);
         env.register_at(&mock_target_id, MockTarget, ());
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         client.confirm(&tx_id, &accounts.user3);
         client.execute(&tx_id);
@@ -2661,7 +2705,7 @@ mod tests {
     #[test]
     fn confirm_then_reject_is_invalid() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         let err = client
             .try_reject(&tx_id, &accounts.user2)
@@ -2673,7 +2717,7 @@ mod tests {
     #[test]
     fn reject_then_confirm_is_invalid() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.reject(&tx_id, &accounts.user2);
         let err = client
             .try_confirm(&tx_id, &accounts.user2)
@@ -2685,7 +2729,7 @@ mod tests {
     #[test]
     fn reject_with_confirmations_is_allowed() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         client.reject(&tx_id, &accounts.user3);
         let tx = client.get_tx(&tx_id);
@@ -2699,7 +2743,7 @@ mod tests {
         let (env, client, accounts) = setup!();
         let mock_target_id = Address::generate(&env);
         env.register_at(&mock_target_id, MockTarget, ());
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         client.confirm(&tx_id, &accounts.user3);
         client.reject(&tx_id, &accounts.user1);
@@ -2743,7 +2787,7 @@ mod tests {
     #[test]
     fn execute_requires_threshold() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         // Below the threshold of 2: execution is still blocked.
         client.confirm(&tx_id, &accounts.user2);
         let err = client.try_execute(&tx_id).unwrap_err().unwrap();
@@ -2756,7 +2800,7 @@ mod tests {
         let (env, client, accounts) = setup!();
         let mock_target_id = Address::generate(&env);
         env.register_at(&mock_target_id, MockTarget, ());
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         client.confirm(&tx_id, &accounts.user3);
         client.execute(&tx_id);
@@ -2768,7 +2812,7 @@ mod tests {
         let (env, client, accounts) = setup!();
         let mock_target_id = Address::generate(&env);
         env.register_at(&mock_target_id, MockTarget, ());
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         client.confirm(&tx_id, &accounts.user3);
         client.execute(&tx_id);
@@ -2824,7 +2868,7 @@ mod tests {
     #[test]
     fn get_confirmations_reflects_recorded_order() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         let empty = client.get_confirmations(&tx_id);
         assert_eq!(empty.len(), 0);
 
@@ -2839,7 +2883,7 @@ mod tests {
     #[test]
     fn get_confirmations_duplicate_confirm_leaves_list_unchanged() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         let err = client
             .try_confirm(&tx_id, &accounts.user2)
@@ -2869,7 +2913,7 @@ mod tests {
     #[test]
     fn get_rejections_reflects_recorded_order() {
         let (env, client, accounts) = setup!();
-        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         let empty = client.get_rejections(&tx_id);
         assert_eq!(empty.len(), 0);
 
@@ -2898,9 +2942,9 @@ mod tests {
     fn get_tx_count_tracks_submits() {
         let (env, client, accounts) = setup!();
         assert_eq!(client.get_tx_count(), 0);
-        client.submit(&accounts.user1, &target(&env), &payload(&env));
-        client.submit(&accounts.user2, &target(&env), &payload(&env));
-        client.submit(&accounts.user1, &target(&env), &payload(&env));
+        client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
+        client.submit(&accounts.user2, &target(&env), &payload(&env), &None);
+        client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         assert_eq!(client.get_tx_count(), 3);
     }
 
@@ -2909,13 +2953,13 @@ mod tests {
         let (env, client, accounts) = setup!();
         // A rejected submit (non-owner) never advances the counter.
         let err = client
-            .try_submit(&accounts.arbiter, &target(&env), &payload(&env))
+            .try_submit(&accounts.arbiter, &target(&env), &payload(&env), &None)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, ForgeError::Unauthorized);
         assert_eq!(client.get_tx_count(), 0);
 
-        client.submit(&accounts.user1, &target(&env), &payload(&env));
+        client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         assert_eq!(client.get_tx_count(), 1);
     }
 
@@ -2929,7 +2973,7 @@ mod tests {
     fn get_transactions_paginates_in_id_order_and_clamps_to_count() {
         let (env, client, accounts) = setup!();
         for _ in 0..5 {
-            client.submit(&accounts.user1, &target(&env), &payload(&env));
+            client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         }
 
         let first = client.get_transactions(&0, &2);
@@ -2963,10 +3007,10 @@ mod tests {
     fn get_transactions_by_status_filters_then_paginates() {
         let (env, client, accounts) = setup!();
         let executable = env.register(MockTarget, ());
-        let pending_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
-        let executed_id = client.submit(&accounts.user1, &executable, &payload(&env));
-        let rejected_id = client.submit(&accounts.user1, &target(&env), &payload(&env));
-        let pending_id_2 = client.submit(&accounts.user1, &target(&env), &payload(&env));
+        let pending_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
+        let executed_id = client.submit(&accounts.user1, &executable, &payload(&env), &None);
+        let rejected_id = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
+        let pending_id_2 = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
         client.confirm(&executed_id, &accounts.user2);
         client.confirm(&executed_id, &accounts.user3);
         client.execute(&executed_id);
@@ -3005,7 +3049,7 @@ mod tests {
         let (env, client, accounts) = setup!();
         let mock_target_id = Address::generate(&env);
         env.register_at(&mock_target_id, MockTarget, ());
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         client.confirm(&tx_id, &accounts.user3);
         client.execute(&tx_id);
@@ -3018,8 +3062,9 @@ mod tests {
     fn execute_target_revert_leaves_tx_unexecuted() {
         let (env, client, accounts) = setup!();
         let mock_target_id = Address::generate(&env);
-        env.register_at(&mock_target_id, BlockingTarget, ());
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        env.register_at(&mock_target_id, MockTarget, ());
+        MockTargetClient::new(&env, &mock_target_id).set_revert(&true);
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         client.confirm(&tx_id, &accounts.user2);
         client.confirm(&tx_id, &accounts.user3);
 
@@ -3035,7 +3080,7 @@ mod tests {
         let (env, client, accounts) = setup!();
         let mock_target_id = Address::generate(&env);
         env.register_at(&mock_target_id, MockTarget, ());
-        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env));
+        let tx_id = client.submit(&accounts.user1, &mock_target_id, &payload(&env), &None);
         // Only one confirmation, threshold is 2.
         client.confirm(&tx_id, &accounts.user2);
         // Should fail before invoking the target.
@@ -3325,7 +3370,12 @@ mod tests {
     #[test]
     fn touch_tx_ttl_extends_and_keeps_tx_state_intact() {
         let (_env, client, accounts, _token, _token_client) = custody!();
-        let tx_id = client.submit(&accounts.user1, &accounts.arbiter, &Bytes::new(&_env));
+        let tx_id = client.submit(
+            &accounts.user1,
+            &accounts.arbiter,
+            &Bytes::new(&_env),
+            &None,
+        );
 
         client.touch_tx_ttl(&tx_id);
 
@@ -4263,7 +4313,7 @@ mod tests {
         let (env, client, accounts) = setup!();
 
         assert_eq!(
-            client.submit(&accounts.user1, &target(&env), &payload(&env)),
+            client.submit(&accounts.user1, &target(&env), &payload(&env), &None),
             1
         );
         assert_eq!(
@@ -4302,6 +4352,188 @@ mod tests {
             .unwrap();
         assert_eq!(err, ForgeError::NotInitialized);
     }
+
+    #[test]
+    fn submit_rejects_past_or_current_expiry() {
+        let (env, client, accounts) = setup!();
+        env.ledger().set_timestamp(1_000);
+
+        // Expiry in past (< now) fails
+        let err = client
+            .try_submit(&accounts.user1, &target(&env), &payload(&env), &Some(999))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+
+        // Expiry exactly at now (== now) fails
+        let err = client
+            .try_submit(&accounts.user1, &target(&env), &payload(&env), &Some(1_000))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+
+        // Expiry in future (> now) succeeds
+        let id = client.submit(&accounts.user1, &target(&env), &payload(&env), &Some(1_001));
+        assert_eq!(id, 1);
+        let tx = client.get_tx(&id);
+        assert_eq!(tx.expiry, Some(1_001));
+        assert_eq!(tx.status, TxStatus::Pending);
+
+        // submit_call also rejects past or current expiry
+        let dummy_target = accounts.deployer.clone();
+        let fn_name = soroban_sdk::symbol_short!("test");
+        let args: Vec<Val> = soroban_sdk::vec![&env];
+        let err = client
+            .try_submit_call(
+                &accounts.user1,
+                &dummy_target,
+                &fn_name,
+                &args,
+                &Some(1_000),
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+    }
+
+    #[test]
+    fn lazy_expiry_evaluation_and_is_live_views() {
+        let (env, client, accounts) = setup!();
+        env.ledger().set_timestamp(1_000);
+
+        let id = client.submit(&accounts.user1, &target(&env), &payload(&env), &Some(2_000));
+
+        // Before expiry: Pending and is_live == true
+        assert_eq!(client.get_tx(&id).status, TxStatus::Pending);
+        assert!(client.is_live(&id));
+        assert!(client.is_tx_live(&id));
+
+        // Just before expiry boundary (2000 - 1 = 1999)
+        env.ledger().set_timestamp(1_999);
+        assert_eq!(client.get_tx(&id).status, TxStatus::Pending);
+        assert!(client.is_live(&id));
+        assert!(client.is_tx_live(&id));
+
+        // At exact expiry boundary (2000)
+        env.ledger().set_timestamp(2_000);
+        assert_eq!(client.get_tx(&id).status, TxStatus::Expired);
+        assert!(!client.is_live(&id));
+        assert!(!client.is_tx_live(&id));
+
+        // After expiry boundary (2001)
+        env.ledger().set_timestamp(2_001);
+        assert_eq!(client.get_tx(&id).status, TxStatus::Expired);
+        assert!(!client.is_live(&id));
+        assert!(!client.is_tx_live(&id));
+    }
+
+    #[test]
+    fn confirmation_at_and_after_boundary_is_rejected() {
+        let (env, client, accounts) = setup!();
+        env.ledger().set_timestamp(1_000);
+
+        let id = client.submit(&accounts.user1, &target(&env), &payload(&env), &Some(2_000));
+        client.confirm(&id, &accounts.user1);
+        assert_eq!(client.get_confirmations(&id).len(), 1);
+
+        // Exact boundary: now == expiry
+        env.ledger().set_timestamp(2_000);
+        let err = client
+            .try_confirm(&id, &accounts.user2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+
+        // Confirmations untouched (only user1 confirmed before expiry)
+        assert_eq!(client.get_confirmations(&id).len(), 1);
+        assert_eq!(client.get_tx(&id).status, TxStatus::Expired);
+
+        // After boundary: now > expiry
+        env.ledger().set_timestamp(2_001);
+        let err = client
+            .try_confirm(&id, &accounts.user2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+        assert_eq!(client.get_confirmations(&id).len(), 1);
+    }
+
+    #[test]
+    fn execute_and_reject_on_expired_tx_fail() {
+        let (env, client, accounts) = setup!();
+        env.ledger().set_timestamp(1_000);
+
+        let id = client.submit(&accounts.user1, &target(&env), &payload(&env), &Some(2_000));
+
+        env.ledger().set_timestamp(2_500);
+
+        // Execution fails with DeadlineReached and leaves state unchanged
+        let err = client.try_execute(&id).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+        assert_eq!(client.get_tx(&id).status, TxStatus::Expired);
+
+        // Rejection fails with DeadlineReached and leaves rejections unchanged
+        let err = client
+            .try_reject(&id, &accounts.user2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::DeadlineReached);
+        assert_eq!(client.get_rejections(&id).len(), 0);
+    }
+
+    #[test]
+    fn threshold_met_before_expiry_remains_executable_after_expiry() {
+        let (env, client, accounts) = setup!();
+        let executable = env.register(MockTarget, ());
+        env.ledger().set_timestamp(1_000);
+
+        let id = client.submit(&accounts.user1, &executable, &payload(&env), &Some(2_000));
+
+        // Threshold is 2 of 3 (user1, user2, user3).
+        // User1 and User2 confirm before expiry at timestamp 1_500.
+        env.ledger().set_timestamp(1_500);
+        client.confirm(&id, &accounts.user1);
+        client.confirm(&id, &accounts.user2);
+        assert_eq!(client.get_confirmations(&id).len(), 2);
+
+        // Advance ledger past expiry deadline
+        env.ledger().set_timestamp(3_000);
+
+        // Remains Pending (not Expired) because threshold was met before expiry!
+        assert_eq!(client.get_tx(&id).status, TxStatus::Pending);
+        assert!(client.is_live(&id));
+        assert!(client.is_tx_live(&id));
+
+        // Execution succeeds even after expiry
+        client.execute(&id);
+        assert_eq!(client.get_tx(&id).status, TxStatus::Executed);
+        assert!(!client.is_live(&id));
+    }
+
+    #[test]
+    fn get_transactions_by_status_includes_expired() {
+        let (env, client, accounts) = setup!();
+        env.ledger().set_timestamp(1_000);
+
+        // tx 1: expires at 2_000
+        let id1 = client.submit(&accounts.user1, &target(&env), &payload(&env), &Some(2_000));
+        // tx 2: expires at 5_000
+        let id2 = client.submit(&accounts.user1, &target(&env), &payload(&env), &Some(5_000));
+        // tx 3: immortal (None)
+        let id3 = client.submit(&accounts.user1, &target(&env), &payload(&env), &None);
+
+        // Advance time to 3_000 (id1 is expired, id2 and id3 are pending)
+        env.ledger().set_timestamp(3_000);
+
+        let expired = client.get_transactions_by_status(&TxStatus::Expired, &0, &10);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired.get_unchecked(0).tx_id, id1);
+
+        let pending = client.get_transactions_by_status(&TxStatus::Pending, &0, &10);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.get_unchecked(0).tx_id, id2);
+        assert_eq!(pending.get_unchecked(1).tx_id, id3);
+    }
 }
 
 // Tests for the new submit_call functionality
@@ -4329,7 +4561,7 @@ mod call_tests {
         let fn_name = symbol_short!("test");
         let args: Vec<Val> = vec![&env, Val::from_u32(42).into()];
 
-        let tx_id = client.submit_call(&accounts.user1, &target, &fn_name, &args);
+        let tx_id = client.submit_call(&accounts.user1, &target, &fn_name, &args, &None);
         assert_eq!(tx_id, 1);
 
         // Verify transaction was stored correctly
@@ -4369,7 +4601,7 @@ mod call_tests {
         let args: Vec<Val> = vec![&env];
 
         let err = client
-            .try_submit_call(&accounts.user3, &target, &fn_name, &args)
+            .try_submit_call(&accounts.user3, &target, &fn_name, &args, &None)
             .unwrap_err()
             .unwrap();
         assert_eq!(err, ForgeError::Unauthorized);

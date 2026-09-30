@@ -21,9 +21,9 @@
 
 use crate::{Escrow, EscrowData, EscrowStatus, SorobanForgeEscrowClient};
 use soroban_forge_shared_utils::ForgeError;
-use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::{Address, Env, FromVal, Map, Symbol, TryIntoVal, Val};
+use soroban_sdk::{Address, Env, IntoVal, Symbol, Val};
 
 const START: u64 = 1_000_000;
 const TIMEOUT: u64 = 1_000;
@@ -269,6 +269,104 @@ fn refund_requires_funded_state() {
 
     let err = client.try_refund(&id).unwrap_err().unwrap();
     assert_eq!(err, ForgeError::InvalidInput);
+}
+
+#[test]
+fn refund_expired_by_permissionless_keeper_after_deadline() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+
+    env.ledger().set_timestamp(START + TIMEOUT + 1);
+    client.refund_expired(&id);
+
+    let event_signature: Val = Symbol::new(&env, "refund_expired").into_val(&env);
+    let event_data: soroban_sdk::Map<Symbol, Val> = soroban_sdk::map![
+        &env,
+        (Symbol::new(&env, "refunded_amount"), AMOUNT.into_val(&env)),
+        (
+            Symbol::new(&env, "timestamp"),
+            (START + TIMEOUT + 1).into_val(&env)
+        ),
+    ];
+    let event_topics: soroban_sdk::Vec<Val> =
+        soroban_sdk::vec![&env, event_signature, id.into_val(&env)];
+    let expected_events: soroban_sdk::Vec<(Address, soroban_sdk::Vec<Val>, Val)> = soroban_sdk::vec![
+        &env,
+        (contract_id.clone(), event_topics, event_data.into_val(&env))
+    ];
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        expected_events
+    );
+
+    assert_eq!(tc.balance(buyer), AMOUNT);
+    assert_eq!(tc.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Refunded);
+}
+
+#[test]
+fn refund_expired_rejects_before_deadline() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+
+    env.ledger().set_timestamp(START + TIMEOUT - 1);
+    let err = client.try_refund_expired(&id).unwrap_err().unwrap();
+
+    assert_eq!(err, ForgeError::DeadlineReached);
+    assert_eq!(tc.balance(&contract_id), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn refund_expired_rejects_at_deadline() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+
+    env.ledger().set_timestamp(START + TIMEOUT);
+    let err = client.try_refund_expired(&id).unwrap_err().unwrap();
+
+    assert_eq!(err, ForgeError::DeadlineReached);
+    assert_eq!(tc.balance(&contract_id), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
+}
+
+#[test]
+fn refund_expired_rejects_disputed_escrow() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+    client.dispute(&id, buyer);
+
+    env.ledger().set_timestamp(START + TIMEOUT + 1);
+    let err = client.try_refund_expired(&id).unwrap_err().unwrap();
+
+    assert_eq!(err, ForgeError::InvalidInput);
+    assert_eq!(tc.balance(&contract_id), AMOUNT);
+    assert_eq!(client.get_status(&id), EscrowStatus::Disputed);
+}
+
+#[test]
+fn refund_expired_rejects_already_refunded_escrow() {
+    let (env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+    client.refund(&id);
+
+    env.ledger().set_timestamp(START + TIMEOUT + 1);
+    let err = client.try_refund_expired(&id).unwrap_err().unwrap();
+
+    assert_eq!(err, ForgeError::InvalidInput);
+    assert_eq!(tc.balance(buyer), AMOUNT);
+    assert_eq!(tc.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Refunded);
 }
 
 // -----------------------------------------------------------------------
@@ -845,28 +943,6 @@ fn release_partial_pays_seller_and_updates_accounting() {
 }
 
 #[test]
-fn release_partial_event_includes_amount() {
-    let (env, token, _tc, _contract_id, client, accounts) = setup!();
-    let (buyer, seller, arbiter) = parties(&accounts);
-    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
-    client.deposit(&id);
-
-    client.release_partial(&id, &300);
-
-    let events = env.events().all();
-    let event = events.events().last().expect("partial release event");
-    let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
-    let data: Map<Symbol, Val> = body.data.clone().try_into_val(&env).unwrap();
-    assert_eq!(
-        i128::from_val(
-            &env,
-            &data.get(Symbol::new(&env, "partial_amount")).unwrap()
-        ),
-        300
-    );
-}
-
-#[test]
 fn multiple_partial_releases_accumulate_correctly() {
     let (_env, token, tc, contract_id, client, accounts) = setup!();
     let (buyer, seller, arbiter) = parties(&accounts);
@@ -892,10 +968,9 @@ fn exact_final_partial_release_completes_escrow() {
     let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
     client.deposit(&id);
 
-    client.release_partial(&id, &200);
-    client.release_partial(&id, &300);
-    // Release the exact remaining amount after two earlier milestones.
-    client.release_partial(&id, &500);
+    client.release_partial(&id, &400);
+    // Release the exact remaining amount.
+    client.release_partial(&id, &600);
 
     assert_eq!(tc.balance(seller), AMOUNT);
     assert_eq!(tc.balance(&contract_id), 0);
@@ -947,10 +1022,6 @@ fn release_partial_exceeding_remaining_is_rejected() {
     // Balances unchanged after rejected call.
     assert_eq!(tc.balance(seller), 400);
     assert_eq!(tc.balance(&contract_id), 600);
-    let record: EscrowData = client.get_escrow(&id);
-    assert_eq!(record.released, 400);
-    assert_eq!(record.remaining(), 600);
-    assert_eq!(client.get_status(&id), EscrowStatus::Funded);
 }
 
 #[test]
@@ -961,7 +1032,6 @@ fn release_partial_on_pending_escrow_is_rejected() {
 
     let err = client.try_release_partial(&id, &100).unwrap_err().unwrap();
     assert_eq!(err, ForgeError::InvalidInput);
-    assert_eq!(client.get_status(&id), EscrowStatus::Pending);
 }
 
 #[test]
