@@ -27,9 +27,11 @@ the threshold is reached; `execute` then performs a real cross-contract
 invocation to the recorded target (an opaque `TxKind::Data` tx) or moves
 real tokens (a typed `TxKind::Withdrawal` tx). A target revert surfaces as
 `ForgeError::ContractInvocationFailed` and leaves the tx `Pending` and
-retryable. `reject` records a formal objection; any rejection blocks
-execution, and reaching the rejection threshold makes the tx `Rejected`
-(terminal).
+retryable. Any owner may `reject` a pending tx; one rejection immediately
+makes it `Rejected` and terminal. The rejector and any existing confirmations
+remain on the record for audit, and `get_tx` continues to expose it.
+Confirming, rejecting, or executing a rejected transaction returns
+`ForgeError::InvalidInput` without changing the record.
 
 ## Transaction query views
 
@@ -102,7 +104,7 @@ recorded balance.
 
 - `Pending` — Awaiting approvals
 - `Executed` — Threshold met and the transaction completed
-- `Rejected` — Rejection threshold met; terminal
+- `Rejected` — Vetoed by an owner; terminal; rejector and existing confirmations retained
 
 ## Storage & TTL Maintenance
 

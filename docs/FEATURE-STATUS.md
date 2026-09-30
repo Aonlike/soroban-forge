@@ -60,6 +60,7 @@ treasury at a terminal transition.
 | `initialize`                                       | ✅ Implemented | Owner set + threshold validation                                                                                                                                                                                        |
 | `submit`                                           | ✅ Implemented | Creates pending transaction record in **persistent storage** (TTL-bumped on write)                                                                                                                                      |
 | `confirm`                                          | ✅ Implemented | One-confirmation-per-owner enforced; tx record re-bumped in persistent storage                                                                                                                                          |
+| `reject`                                           | ✅ Implemented | Any owner may veto a pending tx; one rejection makes it terminal `Rejected`; confirmations are retained, `TxRejected` is emitted, and `get_tx` remains queryable |
 | `execute`                                          | ✅ Implemented | Threshold check + cross-contract `try_invoke_contract` to recorded `target`; status flip **after** invocation; target revert surfaces as `ForgeError::ContractInvocationFailed` and leaves tx `Pending`; events emitted |
 | `get_threshold` / `get_tx`                         | ✅ Implemented | Read-only; `get_tx` reads from persistent storage                                                                                                                                                                       |
 | `submit_withdrawal`                                | ✅ Implemented | Typed `TxKind::Withdrawal` tx; balance validated at execution (transfer first, state second); per-token rolling limit enforced at submission                                                                            |
@@ -83,6 +84,7 @@ treasury at a terminal transition.
 | `initialize` | ✅ Implemented | Owner set + threshold validation |
 | `submit` | ✅ Implemented | Creates pending transaction record |
 | `confirm` | ✅ Implemented | One-confirmation-per-owner enforced |
+| `reject` | ✅ Implemented | Any owner vetoes a pending tx; terminal `Rejected` state with retained confirmations and `TxRejected` event |
 | `execute` | ✅ Implemented | Threshold check + cross-contract `try_invoke_contract` to recorded `target`; status flip **after** invocation; target revert surfaces as `ForgeError::ContractInvocationFailed` and leaves tx `Pending`; events emitted |
 | `get_threshold` / `get_tx` | ✅ Implemented | Read-only |
 | `submit_withdrawal` | ✅ Implemented | Typed `TxKind::Withdrawal` tx; balance validated at execution (transfer first, state second); per-token rolling limit enforced at submission |
